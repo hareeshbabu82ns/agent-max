@@ -1,13 +1,13 @@
 import { z } from "zod";
-import { approveAll, defineTool, type CopilotClient, type CopilotSession, type Tool } from "@github/copilot-sdk";
-import { getDb, addMemory, searchMemories, removeMemory } from "../store/db.js";
-import { readdirSync, readFileSync, statSync } from "fs";
+import { approveAll, defineTool, type Tool } from "@github/copilot-sdk";
+import type { ModelProvider, AISession } from "../types/provider.js";
+import type { AppConfig } from "../types/config.js";
+import type { Store } from "../types/store.js";
+import type { SkillProvider } from "../types/skill.js";
+import { readdirSync, readFileSync } from "fs";
 import { join, sep, resolve } from "path";
 import { homedir } from "os";
-import { listSkills, createSkill, removeSkill } from "./skills.js";
-import { config, persistModel } from "../config.js";
 import { SESSIONS_DIR } from "../paths.js";
-import { getCurrentSourceChannel } from "./orchestrator.js";
 
 function isTimeoutError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -34,7 +34,7 @@ const MAX_CONCURRENT_WORKERS = 5;
 
 export interface WorkerInfo {
   name: string;
-  session: CopilotSession;
+  session: AISession;
   workingDir: string;
   status: "idle" | "running" | "error";
   lastOutput?: string;
@@ -45,9 +45,14 @@ export interface WorkerInfo {
 }
 
 export interface ToolDeps {
-  client: CopilotClient;
+  provider: ModelProvider;
+  store: Store;
+  config: AppConfig;
+  skills: SkillProvider;
+  persistModel: (model: string) => void;
   workers: Map<string, WorkerInfo>;
   onWorkerComplete: (name: string, result: string) => void;
+  getCurrentSourceChannel: () => "telegram" | "tui" | undefined;
 }
 
 export function createTools(deps: ToolDeps): Tool<any>[] {
@@ -81,8 +86,8 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           return `Worker limit reached (${MAX_CONCURRENT_WORKERS}). Active: ${names}. Kill a session first.`;
         }
 
-        const session = await deps.client.createSession({
-          model: config.copilotModel,
+        const session = await deps.provider.createSession({
+          model: deps.config.copilotModel,
           configDir: SESSIONS_DIR,
           workingDirectory: args.working_dir,
           onPermissionRequest: approveAll,
@@ -93,25 +98,19 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           session,
           workingDir: args.working_dir,
           status: "idle",
-          originChannel: getCurrentSourceChannel(),
+          originChannel: deps.getCurrentSourceChannel(),
         };
         deps.workers.set(args.name, worker);
 
-        // Persist to SQLite
-        const db = getDb();
-        db.prepare(
-          `INSERT OR REPLACE INTO worker_sessions (name, copilot_session_id, working_dir, status)
-           VALUES (?, ?, ?, 'idle')`
-        ).run(args.name, session.sessionId, args.working_dir);
+        // Persist to store
+        deps.store.saveWorkerSession(args.name, session.sessionId, args.working_dir);
 
         if (args.initial_prompt) {
           worker.status = "running";
           worker.startedAt = Date.now();
-          db.prepare(
-            `UPDATE worker_sessions SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE name = ?`
-          ).run(args.name);
+          deps.store.updateWorkerStatus(args.name, "running");
 
-          const timeoutMs = config.workerTimeoutMs;
+          const timeoutMs = deps.config.workerTimeoutMs;
           // Non-blocking: dispatch work and return immediately
           session.sendAndWait({
             prompt: `Working directory: ${args.working_dir}\n\n${args.initial_prompt}`,
@@ -126,7 +125,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
             // Auto-destroy background workers after completion to free memory (~400MB per worker)
             session.destroy().catch(() => {});
             deps.workers.delete(args.name);
-            getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
+            deps.store.deleteWorkerSession(args.name);
           });
 
           return `Worker '${args.name}' created in ${args.working_dir}. Task dispatched — I'll notify you when it's done.`;
@@ -155,12 +154,9 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
 
         worker.status = "running";
         worker.startedAt = Date.now();
-        const db = getDb();
-        db.prepare(`UPDATE worker_sessions SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE name = ?`).run(
-          args.name
-        );
+        deps.store.updateWorkerStatus(args.name, "running");
 
-        const timeoutMs = config.workerTimeoutMs;
+        const timeoutMs = deps.config.workerTimeoutMs;
         // Non-blocking: dispatch work and return immediately
         worker.session.sendAndWait({ prompt: args.prompt }, timeoutMs).then((result) => {
           worker.lastOutput = result?.data?.content || "No response";
@@ -173,7 +169,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           // Auto-destroy after each send_to_worker dispatch to free memory
           worker.session.destroy().catch(() => {});
           deps.workers.delete(args.name);
-          getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
+          deps.store.deleteWorkerSession(args.name);
         });
 
         return `Task dispatched to worker '${args.name}'. I'll notify you when it's done.`;
@@ -227,9 +223,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           // Session may already be gone
         }
         deps.workers.delete(args.name);
-
-        const db = getDb();
-        db.prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
+        deps.store.deleteWorkerSession(args.name);
 
         return `Worker '${args.name}' terminated.`;
       },
@@ -308,8 +302,8 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         }
 
         try {
-          const session = await deps.client.resumeSession(args.session_id, {
-            model: config.copilotModel,
+          const session = await deps.provider.resumeSession(args.session_id, {
+            model: deps.config.copilotModel,
             onPermissionRequest: approveAll,
           });
 
@@ -318,15 +312,11 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
             session,
             workingDir: "(attached)",
             status: "idle",
-            originChannel: getCurrentSourceChannel(),
+            originChannel: deps.getCurrentSourceChannel(),
           };
           deps.workers.set(args.name, worker);
 
-          const db = getDb();
-          db.prepare(
-            `INSERT OR REPLACE INTO worker_sessions (name, copilot_session_id, working_dir, status)
-             VALUES (?, ?, '(attached)', 'idle')`
-          ).run(args.name, args.session_id);
+          deps.store.saveWorkerSession(args.name, args.session_id, "(attached)");
 
           return `Attached to session ${args.session_id.slice(0, 8)}… as worker '${args.name}'. You can now send_to_worker to interact with it.`;
         } catch (err) {
@@ -343,7 +333,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         "Shows skill name, description, and whether it's a local or global skill.",
       parameters: z.object({}),
       handler: async () => {
-        const skills = listSkills();
+        const skills = deps.skills.listSkills();
         if (skills.length === 0) {
           return "No skills installed yet. Use learn_skill to teach me something new.";
         }
@@ -372,7 +362,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         ),
       }),
       handler: async (args) => {
-        return createSkill(args.slug, args.name, args.description, args.instructions);
+        return deps.skills.createSkill(args.slug, args.name, args.description, args.instructions);
       },
     }),
 
@@ -385,7 +375,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         slug: z.string().regex(/^[a-z0-9]+(-[a-z0-9]+)*$/).describe("The kebab-case slug of the skill to remove, e.g. 'gmail', 'web-search'"),
       }),
       handler: async (args) => {
-        const result = removeSkill(args.slug);
+        const result = deps.skills.removeSkill(args.slug);
         return result.message;
       },
     }),
@@ -398,11 +388,11 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
       parameters: z.object({}),
       handler: async () => {
         try {
-          const models = await deps.client.listModels();
+          const models = await deps.provider.listModels();
           if (models.length === 0) {
             return "No models available.";
           }
-          const current = config.copilotModel;
+          const current = deps.config.copilotModel;
           const lines = models.map((m) => {
             const active = m.id === current ? " ← active" : "";
             const billing = m.billing ? ` (${m.billing.multiplier}x)` : "";
@@ -425,7 +415,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
       }),
       handler: async (args) => {
         try {
-          const models = await deps.client.listModels();
+          const models = await deps.provider.listModels();
           const match = models.find((m) => m.id === args.model_id);
           if (!match) {
             const suggestions = models
@@ -437,9 +427,9 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
             return `Model '${args.model_id}' not found.${hint}`;
           }
 
-          const previous = config.copilotModel;
-          config.copilotModel = args.model_id;
-          persistModel(args.model_id);
+          const previous = deps.config.copilotModel;
+          deps.config.copilotModel = args.model_id;
+          deps.persistModel(args.model_id);
 
           return `Switched model from '${previous}' to '${args.model_id}'. Takes effect on next message.`;
         } catch (err) {
@@ -462,7 +452,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         source: z.enum(["user", "auto"]).optional().describe("'user' if explicitly asked to remember, 'auto' if Max detected it (default: 'user')"),
       }),
       handler: async (args) => {
-        const id = addMemory(args.category, args.content, args.source || "user");
+        const id = deps.store.addMemory(args.category, args.content, args.source || "user");
         return `Remembered (#${id}, ${args.category}): "${args.content}"`;
       },
     }),
@@ -478,7 +468,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           .describe("Optional: filter by category"),
       }),
       handler: async (args) => {
-        const results = searchMemories(args.keyword, args.category);
+        const results = deps.store.searchMemories(args.keyword, args.category);
         if (results.length === 0) {
           return "No matching memories found.";
         }
@@ -498,7 +488,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         memory_id: z.number().int().describe("The memory ID to remove (from recall results)"),
       }),
       handler: async (args) => {
-        const removed = removeMemory(args.memory_id);
+        const removed = deps.store.removeMemory(args.memory_id);
         return removed
           ? `Memory #${args.memory_id} forgotten.`
           : `Memory #${args.memory_id} not found — it may have already been removed.`;

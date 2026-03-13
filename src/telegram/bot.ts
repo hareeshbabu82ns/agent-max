@@ -52,8 +52,8 @@ export function createBot(): Bot {
       // Validate against available models before persisting
       try {
         const { getClient } = await import("../copilot/client.js");
-        const client = await getClient();
-        const models = await client.listModels();
+        const provider = await getClient();
+        const models = await provider.listModels();
         const match = models.find((m) => m.id === arg);
         if (!match) {
           const suggestions = models

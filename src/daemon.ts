@@ -1,11 +1,16 @@
-import { getClient, stopClient } from "./copilot/client.js";
+import { getProvider, stopClient } from "./copilot/client.js";
 import { initOrchestrator, setMessageLogger, setProactiveNotify, getWorkers } from "./copilot/orchestrator.js";
-import { startApiServer, broadcastToSSE } from "./api/server.js";
+import { startApiServer } from "./api/server.js";
 import { createBot, startBot, stopBot, sendProactiveMessage } from "./telegram/bot.js";
-import { getDb, closeDb } from "./store/db.js";
-import { config } from "./config.js";
+import { getStore, closeDb } from "./store/db.js";
+import { config, persistModel } from "./config.js";
 import { spawn } from "child_process";
 import { checkForUpdate } from "./update.js";
+import { ChannelRegistry } from "./channels/registry.js";
+import { TelegramChannel } from "./channels/telegram-channel.js";
+import { TUIChannel } from "./channels/tui-channel.js";
+import { getSkillDirectories, listSkills, createSkill, removeSkill } from "./copilot/skills.js";
+import type { ServiceContainer } from "./container.js";
 
 function truncate(text: string, max = 200): string {
   const oneLine = text.replace(/\n/g, " ").trim();
@@ -25,29 +30,40 @@ async function main(): Promise<void> {
     console.log(`[max] ${tag} ${arrow}  ${truncate(text)}`);
   });
 
-  // Initialize SQLite
-  getDb();
+  // Initialize store
+  const store = getStore();
   console.log("[max] Database initialized");
 
-  // Start Copilot SDK client
+  // Start model provider
   console.log("[max] Starting Copilot SDK client...");
-  const client = await getClient();
+  const provider = await getProvider();
   console.log("[max] Copilot SDK client ready");
+
+  // Wire up channel registry
+  const channels = new ChannelRegistry();
+  channels.register(new TUIChannel(config));
+  if (config.telegramEnabled) {
+    channels.register(new TelegramChannel(config));
+  }
+
+  // Assemble the service container
+  const svc: ServiceContainer = {
+    store,
+    config,
+    provider,
+    channels,
+    skills: { getSkillDirectories, listSkills, createSkill, removeSkill },
+    persistModel,
+  };
 
   // Initialize orchestrator session
   console.log("[max] Creating orchestrator session...");
-  await initOrchestrator(client);
+  await initOrchestrator(svc);
   console.log("[max] Orchestrator session ready");
 
-  // Wire up proactive notifications — route to the originating channel
   setProactiveNotify((text, channel) => {
     console.log(`[max] bg-notify (${channel ?? "all"}) ⟵  ${truncate(text)}`);
-    if (!channel || channel === "telegram") {
-      if (config.telegramEnabled) sendProactiveMessage(text);
-    }
-    if (!channel || channel === "tui") {
-      broadcastToSSE(text);
-    }
+    channels.broadcast(text, channel).catch(() => {});
   });
 
   // Start HTTP API for TUI

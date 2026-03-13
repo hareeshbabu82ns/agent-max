@@ -1,30 +1,43 @@
-import { CopilotClient } from "@github/copilot-sdk";
+/**
+ * Backward-compatible Copilot client singleton.
+ *
+ * New code should depend on the ModelProvider interface and receive it
+ * via dependency injection. This module exists only for legacy call-sites.
+ */
 
-let client: CopilotClient | undefined;
+import { CopilotProvider } from "../providers/copilot-provider.js";
+import type { ModelProvider } from "../types/provider.js";
 
-export async function getClient(): Promise<CopilotClient> {
-  if (!client) {
-    client = new CopilotClient({
-      autoStart: true,
-      autoRestart: true,
-    });
-    await client.start();
+let provider: CopilotProvider | undefined;
+
+/** Get (or create) the singleton CopilotProvider. */
+export async function getProvider(): Promise<ModelProvider> {
+  if (!provider) {
+    provider = new CopilotProvider();
+    await provider.start();
   }
-  return client;
+  return provider;
 }
 
-/** Tear down the existing client and create a fresh one. */
-export async function resetClient(): Promise<CopilotClient> {
-  if (client) {
-    try { await client.stop(); } catch { /* best-effort */ }
-    client = undefined;
+/**
+ * @deprecated Use getProvider() instead.
+ * Kept for the few call-sites that still expect a CopilotClient.
+ */
+export async function getClient() {
+  return getProvider();
+}
+
+/** Tear down the existing provider and create a fresh one. */
+export async function resetClient(): Promise<ModelProvider> {
+  if (provider) {
+    return provider.reset();
   }
-  return getClient();
+  return getProvider();
 }
 
 export async function stopClient(): Promise<void> {
-  if (client) {
-    await client.stop();
-    client = undefined;
+  if (provider) {
+    await provider.stop();
+    provider = undefined;
   }
 }
