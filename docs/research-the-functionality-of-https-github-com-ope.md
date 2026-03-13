@@ -406,7 +406,7 @@ Prioritized by impact-to-effort ratio:
 | Repository | Purpose | Key Files |
 |------------|---------|-----------|
 | [openclaw/openclaw](https://github.com/openclaw/openclaw) | Full AI gateway | `src/`, `skills/`, `extensions/`, `apps/` |
-| [burkeholland/max](https://github.com/burkeholland/max) (agent-max) | Copilot orchestrator | `src/copilot/`, `src/telegram/`, `src/tui/` |
+| [hareeshbabu82ns/agent-max](https://github.com/hareeshbabu82ns/agent-max) (agent-max) | Copilot orchestrator | `src/copilot/`, `src/telegram/`, `src/tui/` |
 
 ---
 

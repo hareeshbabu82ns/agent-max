@@ -33,11 +33,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/burkeholland/max.git"
+    "url": "https://github.com/hareeshbabu82ns/agent-max.git"
   },
-  "homepage": "https://github.com/burkeholland/max#readme",
+  "homepage": "https://github.com/hareeshbabu82ns/agent-max#readme",
   "bugs": {
-    "url": "https://github.com/burkeholland/max/issues"
+    "url": "https://github.com/hareeshbabu82ns/agent-max/issues"
   },
   "type": "module",
   "dependencies": {
